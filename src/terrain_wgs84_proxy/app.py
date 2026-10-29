@@ -3,6 +3,9 @@ ellipsoidal heights instead of EGM96 orthometric heights.
 
 Only the tile endpoint is converted (that's what SceneView's ElevationLayer uses);
 the service JSON is patched, and everything else is passed through untouched.
+
+Also exposes `/altitude`, which converts point altitudes between WGS84 ellipsoidal,
+orthometric (EGM96, ~MSL) and above-ground-level heights using the same terrain.
 """
 
 from __future__ import annotations
@@ -11,15 +14,18 @@ import asyncio
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from . import lerc1
 from .geoid import GeoidGrid
+from .terrain import TerrainSampler
 
 UPSTREAM = os.environ.get(
     "UPSTREAM_URL",
@@ -32,6 +38,10 @@ GEOID_CACHE = Path(os.environ.get("GEOID_CACHE", Path.home() / ".cache/terrain-w
 TILE_CACHE_SIZE = int(os.environ.get("TILE_CACHE_SIZE", "2000"))
 # Quantization error for re-encoded tiles; defaults to the upstream tile's own value.
 MAX_Z_ERROR = float(os.environ["MAX_Z_ERROR"]) if "MAX_Z_ERROR" in os.environ else None
+# Finest Terrain3D tile level (~2.4 m at the equator) used for AGL lookups.
+TERRAIN_LEVEL = int(os.environ.get("TERRAIN_LEVEL", "16"))
+TERRAIN_CACHE_SIZE = int(os.environ.get("TERRAIN_CACHE_SIZE", "500"))
+ALTITUDE_MAX_POINTS = int(os.environ.get("ALTITUDE_MAX_POINTS", "1000"))
 
 # EGM96 undulation is within roughly [-107, +86] m worldwide.
 GEOID_MIN, GEOID_MAX = -107.0, 86.0
@@ -62,12 +72,13 @@ async def lifespan(app: FastAPI):
     app.state.geoid = await asyncio.to_thread(GeoidGrid.load, GEOID_CACHE)
     app.state.client = httpx.AsyncClient(timeout=30, follow_redirects=True)
     app.state.tiles = TileCache(TILE_CACHE_SIZE)
+    app.state.terrain = TerrainSampler(_tile_fetcher(app.state.client), TERRAIN_CACHE_SIZE)
     yield
     await app.state.client.aclose()
 
 
 app = FastAPI(title="Terrain3D WGS84 ellipsoidal-height proxy", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "HEAD", "OPTIONS"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "HEAD", "POST", "OPTIONS"], allow_headers=["*"])
 
 
 def convert_tile(data: bytes, geoid: GeoidGrid, level: int, row: int, col: int) -> bytes:
@@ -134,6 +145,103 @@ async def passthrough(rest: str, request: Request) -> Response:
         request.method, f"{UPSTREAM}/{rest}", params=dict(request.query_params)
     )
     return Response(upstream.content, status_code=upstream.status_code, headers=_forward_headers(upstream))
+
+
+def _tile_fetcher(client: httpx.AsyncClient):
+    limit = asyncio.Semaphore(16)
+
+    async def fetch(level: int, row: int, col: int) -> bytes | None:
+        async with limit:
+            resp = await client.get(f"{UPSTREAM}/tile/{level}/{row}/{col}")
+        if resp.status_code == 404 or (resp.status_code == 200 and not resp.content.startswith(b"CntZImage")):
+            return None
+        resp.raise_for_status()
+        return resp.content
+
+    return fetch
+
+
+class AltitudeRef(str, Enum):
+    wgs84 = "wgs84"  # WGS84 ellipsoidal height
+    msl = "msl"  # orthometric height, EGM96
+    agl = "agl"  # height above the Terrain3D ground surface
+
+
+class AltitudePoint(BaseModel):
+    lon: float = Field(ge=-180, le=180)
+    lat: float = Field(ge=-90, le=90)
+    alt: float
+
+
+class AltitudeRequest(BaseModel):
+    ref: AltitudeRef = AltitudeRef.wgs84
+    level: int = Field(TERRAIN_LEVEL, ge=0, le=TERRAIN_LEVEL)
+    points: list[AltitudePoint] = Field(min_length=1, max_length=ALTITUDE_MAX_POINTS)
+
+
+class Terrain(BaseModel):
+    msl: float
+    wgs84: float
+    level: int  # tile level the ground height was sampled from (lower = coarser)
+
+
+class AltitudeResult(BaseModel):
+    lon: float
+    lat: float
+    wgs84: float
+    msl: float
+    agl: float
+    geoid_undulation: float  # N: wgs84 = msl + N
+    terrain: Terrain
+
+
+class AltitudeResponse(BaseModel):
+    results: list[AltitudeResult]
+
+
+async def _convert_altitude(request: Request, p: AltitudePoint, ref: AltitudeRef, level: int) -> AltitudeResult:
+    n = float(request.app.state.geoid.undulation(np.array(p.lon), np.array(p.lat)))
+    try:
+        ground, ground_level = await request.app.state.terrain.height(p.lon, p.lat, level)
+    except LookupError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"terrain tile fetch failed: {exc}") from exc
+    if ref is AltitudeRef.wgs84:
+        msl = p.alt - n
+    elif ref is AltitudeRef.msl:
+        msl = p.alt
+    else:
+        msl = p.alt + ground
+    return AltitudeResult(
+        lon=p.lon,
+        lat=p.lat,
+        wgs84=msl + n,
+        msl=msl,
+        agl=msl - ground,
+        geoid_undulation=n,
+        terrain=Terrain(msl=ground, wgs84=ground + n, level=ground_level),
+    )
+
+
+@app.get("/altitude", response_model=AltitudeResult)
+async def altitude(
+    request: Request,
+    lon: float = Query(ge=-180, le=180),
+    lat: float = Query(ge=-90, le=90),
+    alt: float = Query(),
+    ref: AltitudeRef = AltitudeRef.wgs84,
+    level: int = Query(TERRAIN_LEVEL, ge=0, le=TERRAIN_LEVEL),
+) -> AltitudeResult:
+    """Convert one altitude (given relative to `ref`) to WGS84 ellipsoidal, MSL and AGL heights."""
+    return await _convert_altitude(request, AltitudePoint(lon=lon, lat=lat, alt=alt), ref, level)
+
+
+@app.post("/altitude", response_model=AltitudeResponse)
+async def altitude_batch(body: AltitudeRequest, request: Request) -> AltitudeResponse:
+    """Batch version of `GET /altitude`; results are in the same order as `points`."""
+    results = await asyncio.gather(*(_convert_altitude(request, p, body.ref, body.level) for p in body.points))
+    return AltitudeResponse(results=list(results))
 
 
 @app.get("/healthz")
